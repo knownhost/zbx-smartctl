@@ -3,14 +3,39 @@ use warnings;
 use strict;
 
 #must be run as root
-my $VERSION = 1.0;
+my $VERSION = 1.5;
 
 #add path if needed into $smartctl_cmd
-my $smartctl_cmd = "smartctl";
+my $smartctl_cmd = "/usr/sbin/smartctl";
+die "Unable to find smartctl. Check that smartmontools package is installed.\n" unless (-x $smartctl_cmd);
 my $sg_scan_cmd = "/usr/bin/sg_scan";
+my $nvme_cmd = "/usr/sbin/nvme";
 my @input_disks;
 my @global_serials;
 my @smart_disks;
+
+# by providing additional positional arguments you can add disks that are hardly discovered otherwise.
+# for example to force discovery of the following disks provide '/dev/sda_-d_sat+megaraid,00 /dev/sda_-d_sat+megaraid,01' as arguments
+if (@ARGV>0) {
+    foreach my $disk_line (@ARGV) {
+        $disk_line =~ s/_/ /g;
+        my ($disk_name) = $disk_line =~ /(\/(.+?))(?:$|\s)/;
+        my ($disk_args) = $disk_line =~ /(-d [A-Za-z0-9,\+]+)/;
+        if (!defined($disk_args)) {
+           $disk_args = '';
+        }
+
+
+        if ( $disk_name and defined($disk_args) ) {
+            push @input_disks,
+                {
+                    disk_name => $disk_name,
+                    disk_args => $disk_args
+                };
+        }
+    }
+}
+
 
 if ( $^O eq 'darwin' ) {    # if MAC OSX (limited support, consider to use smartctl --scan-open)
 
@@ -25,7 +50,10 @@ if ( $^O eq 'darwin' ) {    # if MAC OSX (limited support, consider to use smart
     }
 }
 else {
-    for (`$smartctl_cmd --scan-open`) {
+    foreach my $line (@{[
+        `$smartctl_cmd --scan-open`,
+        `$smartctl_cmd --scan-open -dnvme`
+        ]}) {
 
         #my $testline = "# /dev/sdc -d usbjmicron # /dev/sdc [USB JMicron], ATA device open" ;
         #for ($testline) {
@@ -35,8 +63,8 @@ else {
         #"/dev/bus/0 -d megaraid,01" for megaraid
         #"# /dev/sdc -d usbjmicron # /dev/sdc [USB JMicron], ATA device open "
 
-        my ($disk_name) = $_ =~ /(\/(.+?))\s/;
-        my ($disk_args) = $_ =~ /(-d [A-Za-z0-9,\+]+)/;
+        my ($disk_name) = $line =~ /(\/(.+?))(?:$|\s)/;
+        my ($disk_args) = $line =~ /(-d [A-Za-z0-9,\+]+)/;
 
         if ( $disk_name and $disk_args ) {
             push @input_disks,
@@ -70,8 +98,27 @@ else {
             }
 
         }
+    }
 
+    if (-x $nvme_cmd){
+        foreach my $line (`$nvme_cmd list`) {
+            ## sg_scan -i
+            # Node             SN                   Model                                    Namespace Usage                      Format           FW Rev
+            # ---------------- -------------------- ---------------------------------------- --------- -------------------------- ---------------- --------
+            # /dev/nvme0n1     S3W8NX0M10ZZZZ       SAMSUNG MZVLB512HAJQ-00000               1          18.87  GB / 512.11  GB    512   B +  0 B   EXA7301Q
+            # /dev/nvme1n1     S3W8NX0M15ZZZZ       SAMSUNG MZVLB512HAJQ-00000               1         511.77  GB / 512.11  GB    512   B +  0 B   EXA7301Q
+            if ($line =~ /(\/(?:.+?))\s/){
+                    my ($disk_name) = $1;
+                    my ($disk_args) = "";
 
+                    push @input_disks,
+                        {
+                            disk_name => $disk_name,
+                            disk_args => $disk_args
+                        };
+            }
+
+        }
     }
 }
 
@@ -82,6 +129,7 @@ foreach my $disk (@input_disks) {
     $disk->{disk_model}='';
     $disk->{disk_sn}='';
     $disk->{subdisk}=0;
+    $disk->{disk_type}=2; # other
 
     if ( @output_arr = get_smart_disks($disk) ) {
         push @smart_disks, @output_arr;
@@ -103,6 +151,9 @@ sub get_smart_disks {
     $disk->{disk_cmd} = $disk->{disk_name};
     if (length($disk->{disk_args}) > 0){
         $disk->{disk_cmd}.=q{ }.$disk->{disk_args};
+        if ( $disk->{subdisk} == 1 and $disk->{disk_args} =~ /-d\s+[^,\s]+,(\S+)/) {
+            $disk->{disk_name} .= " ($1)";
+        }
     }
 
     #my $testline = "open failed: Two devices connected, try '-d usbjmicron,[01]'";
@@ -114,15 +165,11 @@ sub get_smart_disks {
     foreach my $line (@smartctl_output) {
         #foreach my $line ($testline) {
         #print $line;
-        if ( $line =~ /^SMART.+?: +(.+)$/ ) {
+        if ( $line =~ /^(?:SMART.+?: +|Device supports SMART and is +)(.+)$/ ) {
 
             if ( $1 =~ /Enabled/ ) {
                 $disk->{smart_enabled} = 1;
             }
-            elsif ( $1 =~ /Unavailable/ ) {
-                `$smartctl_cmd -i $disk->{disk_cmd} 2>&1`;
-            }
-
             #if SMART is disabled then try to enable it (also offline tests etc)
             elsif ( $1 =~ /Disabled/ ) {
                 foreach (`smartctl -s on -o on -S on $disk->{disk_cmd}`)
@@ -132,53 +179,51 @@ sub get_smart_disks {
             }
         }
     }
-    
+    my $vendor = '';
+    my $product = '';
     foreach my $line (@smartctl_output) {
+        # SAS: filter out non-disk devices (enclosure, cd/dvd)
+        if ( $line =~ /^Device type: +(.+)$/ ) {
+                if ( $1 ne "disk" ) {
+                    return;
+                }
+        }
+        # Areca: filter out empty slots
+        if ( $line =~ /^Read Device Identity failed: empty IDENTIFY data/ ) {
+            return;
+        }
+    
+    
         
         if ( $line =~ /^serial number: +(.+)$/i ) {
-
-            #print "Serial number is ".$2."\n";
-            if ( grep /$1/, @global_serials ) {
-
-                #print "disk already exists skipping\n";
-                return;
-            }
-            else {
                 $disk->{disk_sn} = $1;
-                if ($disk->{smart_enabled} eq 1){
-                    push @global_serials, $1;
-                }
-            }
         }
-        elsif ( $line =~ /^Device Model: +(.+)$/ ) {
+        if ( $line =~ /^Device Model: +(.+)$/i ) {
                 $disk->{disk_model} = $1;
         }
-        
-        if ( $line =~ /Rotation Rate: (.+)/ ) {
 
-            if ( $1 =~ /Solid State Device/ ) {
+        #for NVMe disks and some ATA: Model Number:
+        if ( $line =~ /^Model Number: +(.+)$/i ) {
+                $disk->{disk_model} = $1;
+        }
+        #for SAS disks: Model = Vendor + Product
+        elsif ( $line =~ /^Vendor: +(.+)$/ ) {
+                $vendor = $1;
+                $disk->{disk_model} = $vendor;
+        }
+        elsif ( $line =~ /^Product: +(.+)$/ ) {
+                $product = $1;
+                $disk->{disk_model} .= q{ }.$product;
+        }
+        
+        if ( $line =~ /Rotation Rate: (.+)/i ) {
+
+            if ( $1 =~ /Solid State Device/i ) {
                 $disk->{disk_type} = 1;
             }
             elsif( $1 =~ /rpm/ ) {
                 $disk->{disk_type} = 0;
             }
-        }
-        if ( !exists($disk->{disk_type})) {
-
-                $disk->{disk_type} = 2;
-                foreach my $extended_line (`$smartctl_cmd -a $disk->{disk_cmd} 2>&1`){
-
-                    #search for Spin_Up_Time or Spin_Retry_Count
-                    if ($extended_line  =~ /Spin_/){
-                        $disk->{disk_type} = 0;
-                        last;
-                    }
-                    #search for SSD in uppercase
-                    elsif ($extended_line  =~ / SSD /){
-                        $disk->{disk_type} = 1;
-                        last;
-                    }
-                }
         }
 
         if ( $line =~ /Permission denied/ ) {
@@ -208,9 +253,86 @@ sub get_smart_disks {
         }
         
     }
+    
+    # Areca SATA RAID
+    if ( $disk->{subdisk} == 0 and $vendor eq "Areca" and $product eq "RAID controller" ) {
+        for (my $i = 1; $i <= 16; $i++) {
+            push @disks,
+                get_smart_disks(
+                    {
+                        disk_name => $disk->{disk_name},
+                        disk_args => "-d areca,$i",
+                        disk_model => '',
+                        disk_sn => '',
+                        subdisk   => 1
+                    }
+                );
+        }
+        return @disks;
+    }
+
+    if ( $disk->{disk_name} =~ /nvme/ or $disk->{disk_args} =~ /nvme/) {
+            $disk->{disk_type} = 1; # /dev/nvme is always SSD
+            $disk->{smart_enabled} = 1;
+    }
+    # if disk_type is still unknown after parsing then rerun with extended -a:
+    if ( $disk->{disk_type} == 2) {
+            foreach my $extended_line (`$smartctl_cmd -a $disk->{disk_cmd} 2>&1`){
+
+                #search for Spin_Up_Time or Spin_Retry_Count
+                if ($extended_line  =~ /Spin_/){
+                    $disk->{disk_type} = 0;
+                    last;
+                }
+                #search for SSD in uppercase
+                elsif ($extended_line  =~ / SSD /){
+                    $disk->{disk_type} = 1;
+                    last;
+                }
+                #search for NVME
+                elsif ($extended_line  =~ /NVMe/){
+                    $disk->{disk_type} = 1;
+                    last;
+                }
+                #search for 177 Wear Leveling Count(present only on SSD):
+                elsif ($extended_line  =~ /177 Wear_Leveling/){
+                    $disk->{disk_type} = 1;
+                    last;
+                }
+                #search for 231 SSD_Life_Left (present only on SSD)
+                elsif ($extended_line  =~ /231 SSD_Life_Left/){
+                    $disk->{disk_type} = 1;
+                    last;
+                }
+                #search for 233 Media_Wearout_Indicator (present only on SSD)
+                elsif ($extended_line  =~ /233 Media_Wearout_/){
+                    $disk->{disk_type} = 1;
+                    last;
+                }
+            }
+    }
+    
+    # push to global serials list
+    if ($disk->{smart_enabled} == 1){
+        #print "Serial number is ".$disk->{disk_sn}."\n";
+        if ( grep /$disk->{disk_sn}/, @global_serials ) {
+            # print "disk already exists skipping\n";
+            return;
+        }
+        push @global_serials, $disk->{disk_sn};
+    }
+
     push @disks, $disk;
     return @disks;
 
+}
+
+
+
+sub escape_json_string {
+    my $string = shift;
+    $string =~  s/(\\|")/\\$1/g;
+    return $string;
 }
 
 sub json_discovery {
@@ -218,17 +340,17 @@ sub json_discovery {
 
     my $first = 1;
     print "{\n";
-    print "\t\"data\":[\n\n";
+    print "\t\"data\":[\n";
 
     foreach my $disk ( @{$disks} ) {
 
         print ",\n" if not $first;
         $first = 0;
         print "\t\t{\n";
-        print "\t\t\t\"{#DISKMODEL}\":\"".$disk->{disk_model}."\",\n";
-        print "\t\t\t\"{#DISKSN}\":\"".$disk->{disk_sn}."\",\n";
-        print "\t\t\t\"{#DISKNAME}\":\"".$disk->{disk_name}."\",\n";
-        print "\t\t\t\"{#DISKCMD}\":\"".$disk->{disk_cmd}."\",\n";
+        print "\t\t\t\"{#DISKMODEL}\":\"".escape_json_string($disk->{disk_model})."\",\n";
+        print "\t\t\t\"{#DISKSN}\":\"".escape_json_string($disk->{disk_sn})."\",\n";
+        print "\t\t\t\"{#DISKNAME}\":\"".escape_json_string($disk->{disk_name})."\",\n";
+        print "\t\t\t\"{#DISKCMD}\":\"".escape_json_string($disk->{disk_cmd})."\",\n";
         print "\t\t\t\"{#SMART_ENABLED}\":\"".$disk->{smart_enabled}."\",\n";
         print "\t\t\t\"{#DISKTYPE}\":\"".$disk->{disk_type}."\"\n";
         print "\t\t}";
